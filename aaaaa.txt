@@ -1,0 +1,209 @@
+import os
+from typing import Any
+from django.core.files import File
+import requests
+from django import forms
+from django.core.exceptions import ValidationError
+import logging
+from filters.models import FilterTask
+from languages.models import Language
+from favorites.models import Favorite
+
+from .choices import MatchingChoices
+from .models import Dataset
+from .services import DatasetValidator, FileService
+from services.order_head import BaseOrderForm
+from validators.order_head import validate_order
+
+from validators.filename import validate_filename
+
+logger = logging.getLogger(__name__)
+
+
+def download_file_from_url(url, file_path):
+    try:
+        response = requests.get(url, stream=True)
+    except requests.exceptions.RequestException as e:
+        logger.error(e)
+        return None
+    if response.status_code != requests.codes.ok:
+        logger.error(f"I have status_code={response.status_code}")
+        return None
+    name_file = url.split("/")[-1]
+    with open(file_path + name_file, 'wb') as f:
+        for block in response.iter_content(1024 * 8):
+            if not block:
+                break
+            f.write(block)
+    return True
+
+
+class DatasetCreateForm(forms.ModelForm):
+    from_language = forms.ModelChoiceField(
+        queryset=Language.objects.all(), to_field_name="title", required=True
+    )
+    to_language = forms.ModelChoiceField(
+        queryset=Language.objects.all(), to_field_name="title", required=False
+    )
+    sentence_count = forms.IntegerField(widget=forms.HiddenInput(), required=False)
+    url_from_source = forms.CharField(required=False)
+    url_to_source = forms.CharField(required=False)
+    from_source = forms.FileField()
+    to_source = forms.FileField()
+
+    class Meta:
+        model = Dataset
+        fields = [
+            "title", "from_source", "from_language",
+            "to_source",  "to_language", "sentence_count"
+        ]
+
+    def save(self, commit=True):
+        obj = super().save(commit=False)
+        file_path = "/app/datastudio_prototype/media/datasets/"
+        if self.cleaned_data['url_from_source'] != "":
+            name_from_file = self.cleaned_data['url_from_source'].split("/")[-1]
+            with open(file_path + name_from_file, 'rb') as f:
+                myfile = File(f)
+                obj.from_source.save(name_from_file, myfile)
+            os.remove(file_path + name_from_file)
+        if self.cleaned_data['url_to_source'] != "":
+            name_to_file = self.cleaned_data['url_to_source'].split("/")[-1]
+            with open(file_path + name_to_file, 'rb') as f:
+                myfile = File(f)
+                obj.to_source.save(name_to_file, myfile)
+            os.remove(file_path + name_to_file)
+        if commit:
+            obj.save()
+        return obj
+
+
+    def clean(self) -> dict[str, Any]:
+        cleaned_data = super().clean()
+        to_language = cleaned_data.get("to_language")
+        to_source = cleaned_data.get("to_source")
+        from_language = cleaned_data.get("from_language")
+        from_source = cleaned_data.get("from_source")
+        url_from_source = cleaned_data.get("url_from_source")
+        url_to_source = cleaned_data.get("url_to_source")
+        file_path = "/app/datastudio_prototype/media/datasets/"
+        if url_from_source != "":
+            name_from_file = url_from_source.split("/")[-1]
+            download_file_from_url(url_from_source, file_path)
+            validate_filename(name_from_file)
+        else:
+            validate_filename(from_source.name)
+        if url_to_source != "":
+            name_to_file = url_to_source.split("/")[-1]
+            download_file_from_url(url_to_source, file_path)
+            validate_filename(name_to_file)
+        else:
+            validate_filename(to_source.name)
+        cleaned_data['sentence_count'] = FileService(from_source).count_sentences()
+        DatasetValidator.validate_languages(from_language, to_language)
+        DatasetValidator.validate_files(from_source, to_source, cleaned_data['sentence_count'])
+        return cleaned_data
+
+
+class DatasetUpdateForm(forms.ModelForm):
+    from_language = forms.ModelChoiceField(
+        queryset=Language.objects.all(), required=True
+    )
+    to_language = forms.ModelChoiceField(
+        queryset=Language.objects.all(), required=False
+    )
+
+    class Meta:
+        model = Dataset
+        fields = ["title", "from_language", "to_language"]
+
+    def __init__(self, *args, **kwargs):
+        super(DatasetUpdateForm, self).__init__(*args, **kwargs)
+        if self.instance.to_language is None:
+            self.fields["to_language"].widget.attrs["disabled"] = True
+
+    def clean(self) -> dict[str, Any]:
+        cleaned_data = super().clean()
+        to_language = cleaned_data.get("to_language")
+        from_language = cleaned_data.get("from_language")
+
+        DatasetValidator.validate_languages(from_language, to_language)
+        return cleaned_data
+
+
+class SearchPhraseForm(forms.Form):
+    phrase_from = forms.CharField(min_length=1,
+                                  required=False,
+                                  widget=forms.TextInput(attrs={"class": "form-control"}))
+    phrase_to = forms.CharField(min_length=1,
+                                required=False,
+                                widget=forms.TextInput(attrs={"class": "form-control"}))
+    matching = forms.ChoiceField(choices=MatchingChoices.choices,
+                                 widget=forms.Select(attrs={"class": "form-select"}))
+
+    def clean(self):
+        if not (self.cleaned_data.get("phrase_from") or self.cleaned_data.get("phrase_to")):
+            raise ValidationError("You must specify either phrase_from or phrase_to (at least one field)")
+        return self.cleaned_data
+
+
+class SearchFavoritePhrasesForm(forms.Form):
+    phrase = forms.ModelChoiceField(
+        queryset=Favorite.objects.all(),
+        widget=forms.Select(attrs={"class": "form-select"}))
+
+    def __init__(self, *args, **kwargs):
+        dataset = kwargs.pop('dataset', None)
+        super().__init__(*args, **kwargs)
+        if dataset:
+            self.fields['phrase'].queryset = Favorite.objects.filter(
+                from_language=dataset.from_language,
+                to_language=dataset.to_language
+            )
+
+
+class DatasetCombineForm(forms.ModelForm):
+    title = forms.CharField()
+
+    class Meta:
+        model = Dataset
+        fields = ["title"]
+
+
+class FilterTaskForm(forms.ModelForm):
+    class Meta:
+        model = FilterTask
+        fields = ["title", "filter", "dataset", "save_filter"]
+        widgets = {
+            "title": forms.TextInput(attrs={"class": "form-control"}),
+            "filter": forms.Select(attrs={"class": "form-select"}),
+            "save_filter": forms.CheckboxInput(attrs={"class": "form-check-input"}),
+            "dataset": forms.Select(attrs={"class": "form-select"})
+        }
+
+
+class OrderingDatasetForm(BaseOrderForm):
+    title = forms.CharField(
+        required=False,
+        validators=[validate_order],
+    )
+    sentence_count = forms.CharField(
+        required=False,
+        validators=[validate_order],
+    )
+
+class OrderingFilterTaskForm(BaseOrderForm):
+    title_second = forms.CharField(
+        required=False,
+        validators=[validate_order],
+        label='title',
+    )
+    status= forms.CharField(
+        required=False,
+        validators=[validate_order],
+    )
+
+class RowUpdateForm(forms.Form):
+    row_from = forms.CharField(label='from', widget=forms.TextInput(attrs={"class": "form-control"}))
+    row_to = forms.CharField(label='to', widget=forms.TextInput(attrs={"class": "form-control"}))
+
